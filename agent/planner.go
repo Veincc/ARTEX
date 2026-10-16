@@ -38,6 +38,7 @@ type Planner struct {
 	nonStreamingFn    func() bool                            // resolver: use non-streaming (Complete) path? (nil = streaming)
 	noaEnabledFn      func() bool                            // resolver: use experimental noa compaction? (nil = off)
 	maxTokensFn       func() int                             // resolver: per-reply output cap (nil/0 = send no cap)
+	roleDispatchFn    func() bool                            // resolver: role-based recon→exploit→validate dispatch? (nil = off)
 	compactor         *Compactor                             // cold-node compaction (§7); nil = disabled
 
 	// todos keeps ONE plan-scratchpad per task (keyed by exploration id) so the
@@ -73,6 +74,16 @@ func (p *Planner) SetNoaEnabled(fn func() bool) { p.noaEnabledFn = fn }
 // SetMaxTokens wires a resolver for the per-reply output cap. nil/unset or 0 =
 // send no cap and let the endpoint decide. Read per run, like nonStreaming.
 func (p *Planner) SetMaxTokens(fn func() int) { p.maxTokensFn = fn }
+
+// SetRoleDispatch wires whether this planner should chain recon → exploit →
+// validate intents. nil/unset = off: the wake-up prompt tells it not to set
+// role, and workers keep the generic path. Read per Plan so a settings toggle
+// applies on the next wake without rebuilding the planner.
+func (p *Planner) SetRoleDispatch(fn func() bool) { p.roleDispatchFn = fn }
+
+func (p *Planner) roleDispatchEnabled() bool {
+	return p.roleDispatchFn != nil && p.roleDispatchFn()
+}
 
 func (p *Planner) maxTokens() int {
 	if p.maxTokensFn == nil {
@@ -330,12 +341,19 @@ const plannerDefaultTmpl = `你是一个网络安全平台授权渗透测试系�
    - **深度优先于覆盖度**：coverage 是下限/验收项、不是探索目标本身；发现高价值入口（可能通向 RCE/提权/数据外泄）后，优先派意图把那条路【往深打穿】，而不是为拉平覆盖度去铺广、逐个资产浅测。
    - **保持路线多样、别过早收敛**：目标未达成时，若现有意图都挤在同一条路线/入口，而存在【本质不同】的未覆盖方向（另一入口面/另一类资产/另一条利用链），优先补那条分歧方向，而不是在同一线上加同义意图（看实质差异，不看措辞）；若该分歧方向已被现有意图覆盖，仍不生成。理想是 2–3 条机理不同的路线并存（如"从上传链打"与"从认证绕过打"），某条交出【目标逼近】的证据后才把资源集中过去。**但多样性永远服从顶部【操作约束】**：被约束排除的入口面/端口/主机/操作，即使本质不同也绝不生成意图。
 
-   **串行利用链：分步派，别拆成并行。** 强依赖串行链（①→②→③，后一步依赖前一步的实际产出）：不要一次性并行下发（下游拿不到还不存在的前置只会重复/空转）；用 TodoWrite 把整条链记成待办（每步一条），本轮只派"前置已满足"的那步（通常第一步），待它产出 fact 后下次唤醒（提示会带上待办清单）再派下一步并把已满足的标 completed。"同一件事"别拆两条（"确认触发点"和"触发触发点"是同一步）；只有【平行、互不依赖】的维度（如枚举多个不相关端点）才用多意图并行。
+   **串行利用链：分步派，别拆成并行。** 强依赖串行链（①→②→③，后一步依赖前一步的实际产出）：不要一次性并行下发（下游拿不到还不存在的前置只会重复/空转）；用 TodoWrite 把整条链记成待办（每步一条，跨唤醒保留在同一份清单里），本轮只派"前置已满足"的那步（通常第一步），待它产出 fact 后下次唤醒（提示会带上待办清单，以及该意图新产生的事实 id）再派下一步并把已满足的标 completed。"同一件事"别拆两条（"确认触发点"和"触发触发点"是同一步）；只有【平行、互不依赖】的维度（如枚举多个不相关端点）才用多意图并行。
+
+   **角色链 recon → exploit → validate（仅当文末标明【角色分派：开】）**：一条攻击面不要交给一条通用意图自己做完侦察+利用+复测。用 TodoWrite 把 recon、exploit、validate 记成三条待办，严格串行，add_intent 填写 role：
+   - 先派 recon（role=recon）：只收集指纹、入口、参数、流量，写资产和事实，不报漏洞。本轮只派这一步。
+   - 被 done/finding 唤醒、且【本次触发】带上该意图新产生的事实 id 之后，再派 exploit（role=exploit）：只确认 recon 已经点出的怀疑点。parent_ids 填这些 fact id。前置事实还不存在就不要派。
+   - exploit 写出候选发现后，下次唤醒再派 validate（role=validate）：只复测可复现性。parent_ids 填该 finding 或 fact id。
+   role 留空 = 通用意图，执行者行为与未分角色时完全一致。文末若是【角色分派：关】，不要填 role，也不要按这三角色拆意图。
 
 5. **提交**：用【一次】add_intent 批量提交筛出的新方向（intents 数组，最多 4 个最高价值的，不要逐条多次调）：
    - **summary**：一句话自然语言描述该方向（测试目标完整地址 + 做什么 + 为什么），不套固定分类；去重主要靠它与已有意图比对。
    - **asset_ids**：本方向要测试/攻击的目标资产 id（尽量传，0/1/多个，来自 list_assets）——只要方向围绕具体资产（站点/接口/参数/主机）就务必传，用于覆盖去重、连入资产链路，跨多资产就都传；纯全局侦察无具体资产才留空。
-   - **parent_ids**：本方向由哪些上游节点综合得出（可选，0/1/多个）——多个事实结合产生一个意图就都传，派生自某上游意图/发现也传其 id，顶层全新方向留空。
+   - **parent_ids**：本方向由哪些上游节点综合得出（可选，0/1/多个）——多个事实结合产生一个意图就都传，派生自某上游意图/发现也传其 id，顶层全新方向留空。角色链的下一步用上一阶段新产生的事实/发现 id。
+   - **role**（可选）：recon | exploit | validate。仅【角色分派：开】时按上面的串行链填写；留空表示通用意图，执行者行为与未分角色时完全一致。不要填这三者以外的值。
 
 不重复、不硬凑；但目标未达成、又有未覆盖且更深的打法时，该派就派。简洁、聚焦、高效。`
 
@@ -394,6 +412,9 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	if p.wantConstraints() {
 		sysBody += constraintBlock(ts) // 操作约束(若有)注入系统提示,框定探索边界
 	}
+	// 角色分派默认关。开：文末指令压过正文，要求按 recon→exploit→validate 填 role；
+	// 关：明确不要填 role，意图保持通用。每轮读，切换不用重建 planner。
+	sysBody += roleDispatchDirective(p.roleDispatchEnabled())
 	system, boundary := deferredSystem(sysBody, def)
 	// planner 无自身墙钟预算;有 deadline 时把 MaxDuration 夹逼到剩余,让在跑的规划轮在
 	// 任务到点时进收尾(因超时→任务超时词,因步数→per-run 词)。

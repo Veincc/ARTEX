@@ -268,7 +268,13 @@ const (
 	settingWorkerSubagentsOn      = "worker_subagents_enabled"
 	settingWorkerSubagentMaxDepth = "worker_subagent_max_depth"
 	settingWorkerSubagentParallel = "worker_subagent_max_parallel"
-	settingLLMRecord              = "llm_record"
+	// Role-based planner dispatch. Default off: the planner is told not to set
+	// role, and a worker ignores any role on the intent (generic prompt, full
+	// tool set). On: the planner chains recon → exploit → validate, and a
+	// claimed intent runs with that role's prompt and tool allow-list. An
+	// empty role stays generic either way.
+	settingRoleDispatch = "role_dispatch_enabled"
+	settingLLMRecord    = "llm_record"
 	// LLM 轮询(故障转移)。默认关闭——开启后走「全局激活配置」的 agent 在当前配置
 	// 不可用(余额不足/key 失效/限流/服务异常)时自动切到下一个配置。
 	// settingLLMPoolBindFallback 仅在轮询开启时有意义:默认关闭,即 agent/任务显式
@@ -399,6 +405,23 @@ func (m *Manager) SetWorkerSubagents(enabled bool, maxDepth, maxParallel int) er
 		return err
 	}
 	return m.pg.SetBool(settingWorkerSubagentsOn, enabled)
+}
+
+// RoleDispatchEnabled reports whether the planner should chain recon → exploit
+// → validate and workers should specialize on intent.role. Default false, so
+// existing role-less runs stay on the generic worker. Read per planner wake
+// and per worker execute.
+func (m *Manager) RoleDispatchEnabled() bool {
+	if m == nil || m.pg == nil {
+		return false
+	}
+	return m.pg.GetBool(settingRoleDispatch, false)
+}
+
+// SetRoleDispatch persists the role-dispatch toggle. Read on the next planner
+// wake and the next claimed intent; no agent rebuild.
+func (m *Manager) SetRoleDispatch(enabled bool) error {
+	return m.pg.SetBool(settingRoleDispatch, enabled)
 }
 
 // Enrich returns the asset auto-completion engine (may be nil if init failed).

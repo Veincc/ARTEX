@@ -89,6 +89,10 @@ type Worker struct {
 	// run on the historical path (no Agent tool, no depth seed, settlement
 	// hides only Bash).
 	subagents func() *SubagentConfig
+	// roleDispatch, when non-nil, is read per execute. Nil or false keeps the
+	// generic prompt and full tool set even if the intent payload carries a
+	// role. Empty role stays generic either way.
+	roleDispatch func() bool
 }
 
 // WorkerSessionID returns the stable transcript key used by a worker intent.
@@ -136,6 +140,16 @@ func (w *Worker) maxTokens() int {
 		return 0
 	}
 	return w.maxTokensFn()
+}
+
+// ConfigureRoleDispatch installs a per-run resolver for role-based dispatch.
+// nil or false keeps today's generic worker even if the intent payload carries
+// a role. Read inside execute so a settings toggle applies to the next intent
+// without rebuilding the worker.
+func (w *Worker) ConfigureRoleDispatch(fn func() bool) { w.roleDispatch = fn }
+
+func (w *Worker) roleDispatchEnabled() bool {
+	return w.roleDispatch != nil && w.roleDispatch()
 }
 
 // SetConstraintInject wires a resolver deciding whether this task's operation
@@ -390,13 +404,37 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	if sc != nil {
 		ctx, base, subReg = w.attachSubagents(ctx, base, intent.ID, hooks, sc)
 	}
+	// Role dispatch off, or a role-less intent → generic prompt and the full
+	// tool set (today's worker). On + recon|exploit|validate → that role's
+	// prompt and allow-list for THIS worker. Filter after Agent is attached so
+	// a role that lists Agent keeps Option A. Tools the role hides stay on the
+	// parent registry: nested recon/exploit/validate helpers still filter
+	// against the full set, so intra-phase subagents keep their own allow-lists.
+	role := activeIntentRole(w.roleDispatchEnabled(), intent)
+	workerBase := base
+	if allow := roleToolAllow(role); len(allow) > 0 {
+		workerBase = filterToolsAllow(base, allow)
+	}
 	ctx = WithRunInfo(ctx, RunInfo{TaskID: taskID, ExplorationID: explorationID(ts), IntentID: intent.ID})
-	tools, def, cleanup := AugmentTools(ctx, "worker", base)
+	tools, def, cleanup := AugmentTools(ctx, "worker", workerBase)
 	defer cleanup()
 	// Publish the post-augmentation instances (same ToolSet closures the worker
 	// calls, plus Agent) so nested record_fact/report_finding/insert_assets stay
-	// attributed to this intent.
+	// attributed to this intent. Role-hidden tools are added back for nested
+	// allow-lists only — they are not in the worker's own tool list.
 	fillSubagentRegistry(subReg, tools)
+	if subReg != nil && role != "" {
+		seen := map[string]bool{}
+		for _, t := range tools {
+			seen[t.Name()] = true
+		}
+		for _, t := range base {
+			if !seen[t.Name()] {
+				subReg.Add(guardPanic(t))
+				seen[t.Name()] = true
+			}
+		}
+	}
 
 	// 意图是 worker 的【唯一职责、贯穿整个 run 的不变量】→ 连同启动指令、意图锚定的目标资产
 	// 原始数据一起放进 system prompt：system 每次 run 都重新拼一遍、绝不会被 compaction 压掉，
@@ -410,7 +448,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// inherit a parent run's background into the action reviewer.
 	ctx = intercept.WithReviewContext(ctx, runDir, intercept.ReviewBackground{})
 	overview := renderWorkerGraphOverview(tsx.graphOverviewData())
-	sysBody := workerSystem(w.proxyAddr, w.proxyCACert, w.workDir, runDir)
+	sysBody := workerSystemForRole(role, w.proxyAddr, w.proxyCACert, w.workDir, runDir)
 	if w.wantConstraints() {
 		sysBody += constraintBlock(ts) // 操作约束(若有)注入系统提示,worker 执行时严格遵守
 	}
