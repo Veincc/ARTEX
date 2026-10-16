@@ -549,6 +549,18 @@ func (s *Server) invalidateTaskAgents() {
 	s.taskAgentMu.Unlock()
 }
 
+// workerSubagentConfig is the per-intent subagent resolver. Nil when the
+// feature flag is off, which keeps Worker.execute on its historical path.
+func (s *Server) workerSubagentConfig() *agent.SubagentConfig {
+	if s == nil || s.m == nil || !s.m.WorkerSubagentsEnabled() {
+		return nil
+	}
+	return &agent.SubagentConfig{
+		MaxDepth:    s.m.WorkerSubagentMaxDepth(),
+		MaxParallel: s.m.WorkerSubagentMaxParallel(),
+	}
+}
+
 func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	s.taskAgentMu.Lock()
 	defer s.taskAgentMu.Unlock()
@@ -571,6 +583,8 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	wk.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
 	wk.SetWebSearch(s.webSearchFor("worker"))
 	wk.SetConstraintInject(s.constraintInjectWorker) // 操作约束注入 worker(可配置,默认开)
+	// 子代理默认关。解析器每条意图读一次设置：关 → nil → execute 不注入 Agent。
+	wk.ConfigureSubagents(s.workerSubagentConfig)
 	pl := agent.NewPlanner(plannerRuntime, "task-router", s.m.dir, tx, plannerRuntime.CompactionWindow(), s.agentMaxTurns("planner"))
 	pl.SetFindingRecorder(s.evidenceStore())
 	pl.SetCompactionWindowResolver(plannerRuntime.CompactionWindow)

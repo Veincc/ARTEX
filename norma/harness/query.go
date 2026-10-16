@@ -102,6 +102,12 @@ type QueryInput struct {
 	// findings instead of ending abruptly. The run still finishes with the budget's
 	// reason (ReasonMaxTurns/ReasonTimeout), never ReasonCompleted. Nil = off.
 	Settlement *Settlement
+	// InterruptTools, when non-nil and closed, aborts the in-flight tool the same
+	// way a MaxDuration deadline does (tool context only) and then enters
+	// settlement while the parent context stays live. A cancelled parent context
+	// still aborts with no wrap-up. Nil = off. Used by a host tree-budget to shed
+	// the deepest leaf without discarding its partial writes.
+	InterruptTools <-chan struct{}
 }
 
 // Settlement configures the wrap-up phase that runs when a budget is hit.
@@ -386,6 +392,22 @@ func (l *loop) run() {
 		l.toolCtx, stopTool = context.WithDeadline(l.ctx, l.startTime.Add(l.in.MaxDuration))
 		defer stopTool()
 	}
+	// A tree-budget shed closes InterruptTools. Cancel tool execution only, so the
+	// parent context (pause / planner kill) is unchanged and the aborted-tool path
+	// below can enter settlement on the live ctx. The goroutine exits when the
+	// tool context is cancelled, including the defer below when the loop returns.
+	if l.in.InterruptTools != nil {
+		var stopInterrupt context.CancelFunc
+		l.toolCtx, stopInterrupt = context.WithCancel(l.toolCtx)
+		defer stopInterrupt()
+		go func() {
+			select {
+			case <-l.in.InterruptTools:
+				stopInterrupt()
+			case <-l.toolCtx.Done():
+			}
+		}()
+	}
 	iterations := 0
 	for {
 		if l.ctx.Err() != nil {
@@ -562,12 +584,18 @@ func (l *loop) run() {
 		nextTurn := l.turnCount + 1
 		hitTurns := l.in.MaxTurns > 0 && nextTurn > l.in.MaxTurns
 		hitTime := l.in.MaxDuration > 0 && time.Since(l.startTime) >= l.in.MaxDuration
-		if hitTurns || hitTime {
+		interrupt := interruptFired(l.in.InterruptTools)
+		if hitTurns || hitTime || interrupt {
 			reason := ReasonMaxTurns
-			if hitTime && !hitTurns {
+			if (hitTime && !hitTurns) || interrupt {
 				reason = ReasonTimeout
 			}
 			if l.beginSettlement(reason, &schemas) {
+				// A shed cancels toolCtx. Wrap-up tools must run on the live parent,
+				// same as the in-flight MaxDuration path above.
+				if interrupt {
+					l.toolCtx = l.ctx
+				}
 				l.lastContinue = ContinueNextTurn
 				continue
 			}
@@ -610,6 +638,20 @@ func (l *loop) beginSettlement(reason TerminalReason, schemas *[]llm.ToolSchema)
 		*schemas = filterToolSchemas(*schemas, s.DisabledTools)
 	}
 	return true
+}
+
+// interruptFired reports whether a host closed InterruptTools. A nil channel is
+// off. The select is non-blocking so a still-open channel does not stall the loop.
+func interruptFired(ch <-chan struct{}) bool {
+	if ch == nil {
+		return false
+	}
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
 }
 
 // filterToolSchemas returns schemas with the named tools removed.

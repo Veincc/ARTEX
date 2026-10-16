@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 
 	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/llm"
@@ -34,6 +35,10 @@ type Config struct {
 	MaxDepth    int // default 3
 	CanUseTool  permission.CanUseTool
 	Hooks       harness.HookRunner
+	// Settlement, when set, is applied to every subagent run so a budget-terminated
+	// or tree-budget-shed child checkpoints without the tools listed in
+	// DisabledTools (hosts use this to hide Bash and Agent during wrap-up).
+	Settlement *harness.Settlement
 	// Transcript, when non-nil, persists each subagent run to its own sidechain
 	// file under the parent session (whose id is read from the context). Subagent
 	// tokens are recorded there, separate from the parent's totals.
@@ -47,6 +52,40 @@ const depthKey ctxKey = 0
 func depth(ctx context.Context) int {
 	v, _ := ctx.Value(depthKey).(int)
 	return v
+}
+
+// WithDepth seeds the subagent recursion depth on ctx. Hosts embedding a
+// subagent tree under an existing agent (the "root") use this so the root
+// counts as a level. A bare context is depth 0. norma refuses an Agent call
+// when depth(ctx) >= Config.MaxDepth, then runs the child at depth+1.
+func WithDepth(ctx context.Context, n int) context.Context {
+	return context.WithValue(ctx, depthKey, n)
+}
+
+// Depth returns the current subagent recursion depth carried on ctx.
+func Depth(ctx context.Context) int { return depth(ctx) }
+
+// toolInterruptKey carries the channel TreeBudget (or a test) closes to ask the
+// subagent run on this context to stop probing and enter settlement. It is
+// distinct from cancelling ctx: a parent cancel (pause/kill) still aborts with
+// no wrap-up, while closing the channel only interrupts in-flight tools.
+type toolInterruptKey struct{}
+
+// WithToolInterrupt returns a child of ctx and a function that requests the
+// subagent run using that child to interrupt in-flight tools and enter
+// settlement (when Config.Settlement is set). The parent context stays live, so
+// the wrap-up model call can finish. The shed function is idempotent.
+func WithToolInterrupt(ctx context.Context) (context.Context, func()) {
+	ch := make(chan struct{})
+	var once sync.Once
+	ctx = context.WithValue(ctx, toolInterruptKey{}, (<-chan struct{})(ch))
+	return ctx, func() { once.Do(func() { close(ch) }) }
+}
+
+// ToolInterrupt returns the shed channel on ctx, or nil when none was set.
+func ToolInterrupt(ctx context.Context) <-chan struct{} {
+	ch, _ := ctx.Value(toolInterruptKey{}).(<-chan struct{})
+	return ch
 }
 
 // NewTool builds the "Agent" CoreTool that dispatches to a named subagent.
@@ -132,6 +171,8 @@ func run(ctx context.Context, cfg Config, def Definition, agentType, prompt, wor
 		PermissionMode: def.PermissionMode,
 		CanUseTool:     cfg.CanUseTool,
 		Hooks:          cfg.Hooks,
+		Settlement:     cfg.Settlement,
+		InterruptTools: ToolInterrupt(ctx),
 	}
 	// Persist this run to its own sidechain under the parent session.
 	if cfg.Transcript != nil {

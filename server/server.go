@@ -3290,19 +3290,22 @@ func (s *Server) settingsPayload() map[string]any {
 		concLimit = defaultConcurrencyLimit // 关闭时也回显一个合理默认值给 UI
 	}
 	return map[string]any{
-		"traffic_capture":          s.m.TrafficEnabled(),
-		"agent_traffic_binding":    s.m.pg.GetBool(settingAgentTrafficBinding, false),
-		"llm_record":               s.m.LLMRecordEnabled(),
-		"web_search_enabled":       on,
-		"web_search_backend":       backend,
-		"brave_key_set":            strings.TrimSpace(braveKey) != "",
-		"tavily_key_set":           strings.TrimSpace(tavilyKey) != "",
-		"web_search_proxy":         proxy,                       // 独立出口代理(http/https/socks5)，空=直连
-		"global_proxy":             s.m.GlobalProxy(),           // 全局出口代理(http/https/socks5)，所有目标流量走它，空=直连
-		"python_interpreter":       strings.TrimSpace(pyStored), // 用户/自动设的值(空=用运行时检测)
-		"workers":                  s.m.Workers(),               // 并发工作 agent 数(默认3)；对之后启动的任务生效
-		"task_concurrency_enabled": concOn,                      // 任务并发上限开关(默认关)
-		"task_concurrency_limit":   concLimit,                   // 同时运行任务上限(开启后默认5)
+		"traffic_capture":              s.m.TrafficEnabled(),
+		"agent_traffic_binding":        s.m.pg.GetBool(settingAgentTrafficBinding, false),
+		"llm_record":                   s.m.LLMRecordEnabled(),
+		"web_search_enabled":           on,
+		"web_search_backend":           backend,
+		"brave_key_set":                strings.TrimSpace(braveKey) != "",
+		"tavily_key_set":               strings.TrimSpace(tavilyKey) != "",
+		"web_search_proxy":             proxy,                           // 独立出口代理(http/https/socks5)，空=直连
+		"global_proxy":                 s.m.GlobalProxy(),               // 全局出口代理(http/https/socks5)，所有目标流量走它，空=直连
+		"python_interpreter":           strings.TrimSpace(pyStored),     // 用户/自动设的值(空=用运行时检测)
+		"workers":                      s.m.Workers(),                   // 并发工作 agent 数(默认3)；对之后启动的任务生效
+		"worker_subagents_enabled":     s.m.WorkerSubagentsEnabled(),    // worker 子代理(默认关)；关则行为与未接入时一致
+		"worker_subagent_max_depth":    s.m.WorkerSubagentMaxDepth(),    // 子代理树深度(默认3：worker=1，再允许两层)
+		"worker_subagent_max_parallel": s.m.WorkerSubagentMaxParallel(), // 单条意图的子代理并发预算(默认4)
+		"task_concurrency_enabled":     concOn,                          // 任务并发上限开关(默认关)
+		"task_concurrency_limit":       concLimit,                       // 同时运行任务上限(开启后默认5)
 		// LLM 轮询(故障转移)。默认关；开启后走全局激活配置的 agent 在当前配置不可用时
 		// 自动切到下一个配置。bind_fallback 仅在轮询开启时有意义(默认关)。
 		"llm_pool_enabled":       s.m.LLMPoolEnabled(),
@@ -3373,6 +3376,10 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		GlobalProxy      *string `json:"global_proxy"`       // 全局出口代理(http/https/socks5)；null=不改，""=清空(直连)
 		PythonInterp     *string `json:"python_interpreter"` // 自定义脚本工具的 python 解释器路径
 		Workers          *int    `json:"workers"`            // 并发工作 agent 数(>0)；对之后启动的任务生效
+		// worker 子代理。默认关；每条意图执行时读取，无需重建 agent。
+		WorkerSubagentsEnabled    *bool `json:"worker_subagents_enabled"`
+		WorkerSubagentMaxDepth    *int  `json:"worker_subagent_max_depth"`
+		WorkerSubagentMaxParallel *int  `json:"worker_subagent_max_parallel"`
 		// 任务并发上限:同时「运行中」的任务数上限。关闭=不限;开启后新建任务超限则排队,有空位自动启动。
 		ConcurrencyEnabled *bool `json:"task_concurrency_enabled"`
 		ConcurrencyLimit   *int  `json:"task_concurrency_limit"`
@@ -3447,6 +3454,25 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Workers != nil {
 		if err := s.m.SetWorkers(*req.Workers); err != nil {
+			writeErr(w, 400, err.Error())
+			return
+		}
+	}
+	if req.WorkerSubagentsEnabled != nil || req.WorkerSubagentMaxDepth != nil || req.WorkerSubagentMaxParallel != nil {
+		// 部分 PUT：没给的字段沿用当前值，避免只改开关把深度/并发重置。
+		enabled := s.m.WorkerSubagentsEnabled()
+		depth := s.m.WorkerSubagentMaxDepth()
+		parallel := s.m.WorkerSubagentMaxParallel()
+		if req.WorkerSubagentsEnabled != nil {
+			enabled = *req.WorkerSubagentsEnabled
+		}
+		if req.WorkerSubagentMaxDepth != nil {
+			depth = *req.WorkerSubagentMaxDepth
+		}
+		if req.WorkerSubagentMaxParallel != nil {
+			parallel = *req.WorkerSubagentMaxParallel
+		}
+		if err := s.m.SetWorkerSubagents(enabled, depth, parallel); err != nil {
 			writeErr(w, 400, err.Error())
 			return
 		}

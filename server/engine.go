@@ -539,6 +539,9 @@ type steerHooks struct {
 	limit int
 	// label 形如 "worker-1 · #42"，只用于日志。
 	label string
+	// emit, when set, records a subagent-start activity for the live view.
+	// Nil in tests that only exercise steer/stop.
+	emit func(db.Activity)
 }
 
 // 空转回合(只有思考、既无正文也无工具调用)续跑次数的默认值，与 SDK 空响应重试的
@@ -589,6 +592,28 @@ func (h steerHooks) PreToolUse(ctx context.Context, name string, input []byte) (
 func (h steerHooks) PostToolUse(ctx context.Context, name string, input, result []byte, isErr bool) {
 	if h.inner != nil {
 		h.inner.PostToolUse(ctx, name, input, result, isErr)
+	}
+}
+
+// FireSubagentStart is the seam norma's subagent runner type-asserts on the
+// shared hook runner. Delegate to the inner guard (so SubagentStart hooks
+// fire) and surface the start on the task activity stream. A missing method
+// on inner is fine — older hook runners only implement Pre/Post/Stop.
+func (h steerHooks) FireSubagentStart(ctx context.Context, agentType string) {
+	if h.inner != nil {
+		if fs, ok := h.inner.(interface {
+			FireSubagentStart(context.Context, string)
+		}); ok {
+			fs.FireSubagentStart(ctx, agentType)
+		}
+	}
+	log.Printf("[work %s] 子代理启动: %s", h.label, agentType)
+	if h.emit != nil {
+		h.emit(db.Activity{
+			Kind:    "subagent_start",
+			Tool:    "Agent",
+			Summary: "子代理启动: " + agentType,
+		})
 	}
 }
 
@@ -1012,6 +1037,11 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		nudges: &atomic.Int64{},
 		limit:  e.emptyTurnNudgeLimit(),
 		label:  label,
+		emit: func(a db.Activity) {
+			nid := iid
+			a.NodeID, a.Worker = &nid, name
+			emit(a)
+		},
 	}
 	wTaskID, _ := strconv.ParseInt(t.ID, 10, 64)
 	e.BeginLLMCall(t.ID)
