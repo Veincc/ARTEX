@@ -160,55 +160,16 @@ func subagentDefs(intentID int64) map[string]subagent.Definition {
 		"；只有你本次真实触发、拿到可复现证据时才用 report_finding，并传同一个 intent_id。" +
 		"不要动手做这条意图以外的事。需要把一块独立子任务隔离开时，可以调用 Agent 再委派一层（recon / exploit / validate）；层数有上限，被拒绝就自己做完并写回。" +
 		"边做边写回，不要攒到最后。"
-	return map[string]subagent.Definition{
-		"recon": {
-			Description: "对当前意图里一个窄目标做隔离侦察，返回发现摘要。可写资产和事实，不报漏洞。",
-			Prompt: []string{
-				"你是侦察子代理。只收集当前意图范围内的信息（指纹、入口、参数、已有流量），把新资产 insert_assets、结论 record_fact。不要报告漏洞，不要扩大到别的意图。",
-				common,
-			},
-			Tools: []string{
-				"Bash", "Read", "LS", "sleep",
-				"list_assets", "list_findings", "node_detail",
-				"search_all_worker_traces", "get_worker_trace",
-				"record_fact", "insert_assets",
-				"traffic_search", "traffic_get", "traffic_blob",
-				"Agent",
-			},
+	specs := roleSpecs()
+	out := make(map[string]subagent.Definition, len(specs))
+	for name, spec := range specs {
+		out[name] = subagent.Definition{
+			Description:    spec.Description,
+			Prompt:         []string{spec.Lead, common},
+			Tools:          append([]string{}, spec.Tools...),
 			PermissionMode: permission.ModeBypass,
-			MaxTurns:       subagentTurnBudget["recon"],
-		},
-		"exploit": {
-			Description: "针对当前意图里一个已怀疑的点做触发确认，拿到证据后写回事实或漏洞。",
-			Prompt: []string{
-				"你是利用确认子代理。只验证当前意图里已经点出的那一个怀疑点，用你真实执行得到的输出作证据。确认不了就 record_fact 记 inferred，不要把猜测写成 report_finding。",
-				common,
-			},
-			Tools: []string{
-				"Bash", "Read", "Write", "Edit", "LS", "sleep",
-				"record_fact", "report_finding", "insert_assets",
-				"list_assets", "list_findings", "node_detail",
-				"traffic_search", "traffic_get", "traffic_blob",
-				"Agent",
-			},
-			PermissionMode: permission.ModeBypass,
-			MaxTurns:       subagentTurnBudget["exploit"],
-		},
-		"validate": {
-			Description: "复测一条候选发现是否可复现，返回结论。",
-			Prompt: []string{
-				"你是复测子代理。只重放候选发现的复现步骤，判断这次能否再次观察到同一结果。复现成功用 report_finding（或在已有事实上补 record_fact）；复现失败用 record_fact 写明看到了什么。不要发明新的攻击面。",
-				common,
-			},
-			Tools: []string{
-				"Bash", "Read", "LS", "sleep",
-				"record_fact", "report_finding",
-				"list_findings", "node_detail",
-				"traffic_search", "traffic_get", "traffic_blob",
-				"Agent",
-			},
-			PermissionMode: permission.ModeBypass,
-			MaxTurns:       subagentTurnBudget["validate"],
-		},
+			MaxTurns:       subagentTurnBudget[name],
+		}
 	}
+	return out
 }

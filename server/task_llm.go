@@ -549,6 +549,12 @@ func (s *Server) invalidateTaskAgents() {
 	s.taskAgentMu.Unlock()
 }
 
+// roleDispatchEnabled is read per planner wake and per worker execute.
+// Off (the default) keeps generic intents and the generic worker.
+func (s *Server) roleDispatchEnabled() bool {
+	return s != nil && s.m != nil && s.m.RoleDispatchEnabled()
+}
+
 // workerSubagentConfig is the per-intent subagent resolver. Nil when the
 // feature flag is off, which keeps Worker.execute on its historical path.
 func (s *Server) workerSubagentConfig() *agent.SubagentConfig {
@@ -585,6 +591,8 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	wk.SetConstraintInject(s.constraintInjectWorker) // 操作约束注入 worker(可配置,默认开)
 	// 子代理默认关。解析器每条意图读一次设置：关 → nil → execute 不注入 Agent。
 	wk.ConfigureSubagents(s.workerSubagentConfig)
+	// 角色分派默认关。每条意图读一次：关或 role 为空 → 通用 worker。
+	wk.ConfigureRoleDispatch(s.roleDispatchEnabled)
 	pl := agent.NewPlanner(plannerRuntime, "task-router", s.m.dir, tx, plannerRuntime.CompactionWindow(), s.agentMaxTurns("planner"))
 	pl.SetFindingRecorder(s.evidenceStore())
 	pl.SetCompactionWindowResolver(plannerRuntime.CompactionWindow)
@@ -596,6 +604,7 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	pl.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
 	pl.SetWebSearch(s.webSearchFor("planner"))
 	pl.SetConstraintInject(s.constraintInjectPlanner) // 操作约束注入 planner(可配置,默认开)
+	pl.SetRoleDispatch(s.roleDispatchEnabled)         // 角色分派(默认关)；开则按 recon→exploit→validate 串行派发
 	// cold-digest §7: 冷节点后台压缩。引擎经权威解析器实际驱动的就是这套 per-task planner
 	// (agentsForTask),Compactor 必须接在这里。走任务路由的 planner provider(§4:与 agent
 	// 同模型,随任务 LLM 链解析),压缩用 Complete 一次性生成 body。

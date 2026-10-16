@@ -3304,6 +3304,7 @@ func (s *Server) settingsPayload() map[string]any {
 		"worker_subagents_enabled":     s.m.WorkerSubagentsEnabled(),    // worker 子代理(默认关)；关则行为与未接入时一致
 		"worker_subagent_max_depth":    s.m.WorkerSubagentMaxDepth(),    // 子代理树深度(默认3：worker=1，再允许两层)
 		"worker_subagent_max_parallel": s.m.WorkerSubagentMaxParallel(), // 单条意图的子代理并发预算(默认4)
+		"role_dispatch_enabled":        s.m.RoleDispatchEnabled(),       // 规划者按 recon→exploit→validate 派意图(默认关)；关则 worker 忽略 role
 		"task_concurrency_enabled":     concOn,                          // 任务并发上限开关(默认关)
 		"task_concurrency_limit":       concLimit,                       // 同时运行任务上限(开启后默认5)
 		// LLM 轮询(故障转移)。默认关；开启后走全局激活配置的 agent 在当前配置不可用时
@@ -3380,6 +3381,8 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		WorkerSubagentsEnabled    *bool `json:"worker_subagents_enabled"`
 		WorkerSubagentMaxDepth    *int  `json:"worker_subagent_max_depth"`
 		WorkerSubagentMaxParallel *int  `json:"worker_subagent_max_parallel"`
+		// 角色分派。默认关；planner 每轮、worker 每条意图读取，无需重建 agent。
+		RoleDispatchEnabled *bool `json:"role_dispatch_enabled"`
 		// 任务并发上限:同时「运行中」的任务数上限。关闭=不限;开启后新建任务超限则排队,有空位自动启动。
 		ConcurrencyEnabled *bool `json:"task_concurrency_enabled"`
 		ConcurrencyLimit   *int  `json:"task_concurrency_limit"`
@@ -3474,6 +3477,12 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := s.m.SetWorkerSubagents(enabled, depth, parallel); err != nil {
 			writeErr(w, 400, err.Error())
+			return
+		}
+	}
+	if req.RoleDispatchEnabled != nil {
+		if err := s.m.SetRoleDispatch(*req.RoleDispatchEnabled); err != nil {
+			writeErr(w, 500, err.Error())
 			return
 		}
 	}
