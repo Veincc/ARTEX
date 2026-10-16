@@ -85,6 +85,10 @@ type Worker struct {
 	// maxTokensFn resolves the per-reply output cap in tokens, on the same
 	// per-run basis. nil or 0 = send no cap and let the endpoint decide.
 	maxTokensFn func() int
+	// subagents, when non-nil, is read per execute. A nil return leaves this
+	// run on the historical path (no Agent tool, no depth seed, settlement
+	// hides only Bash).
+	subagents func() *SubagentConfig
 }
 
 // WorkerSessionID returns the stable transcript key used by a worker intent.
@@ -373,13 +377,26 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// base = built-in worker tools ∪ host tools (traffic) ∪ default tools (incl. Bash);
 	// then augment with the agent's visible skills/MCP. During the SDK settlement
 	// phase, Bash is hidden via Settlement.DisabledTools (no local gating needed).
+	// When worker subagents are enabled, Agent is hidden in that same list so
+	// wrap-up cannot spawn.
 	base := append(tsx.WorkerTools(), w.extraTools...)
 	// worker 刻意不给 MultiEdit/Glob/Grep：文件精改用 Edit、检索走 Bash(grep/find)，
 	// 收敛工具面、减少低价值调用。其余 SDK 默认工具(Read/Write/Edit/LS/Bash/Sleep)照常。
 	base = append(base, defaultToolsExcept("MultiEdit", "Glob", "Grep")...)
+	// Subagents off (nil config) → base/ctx unchanged. On → append the shared
+	// Agent tool and seed depth 1 so the worker is the tree root.
+	sc := w.subagentConfig()
+	var subReg *actool.Registry
+	if sc != nil {
+		ctx, base, subReg = w.attachSubagents(ctx, base, intent.ID, hooks, sc)
+	}
 	ctx = WithRunInfo(ctx, RunInfo{TaskID: taskID, ExplorationID: explorationID(ts), IntentID: intent.ID})
 	tools, def, cleanup := AugmentTools(ctx, "worker", base)
 	defer cleanup()
+	// Publish the post-augmentation instances (same ToolSet closures the worker
+	// calls, plus Agent) so nested record_fact/report_finding/insert_assets stay
+	// attributed to this intent.
+	fillSubagentRegistry(subReg, tools)
 
 	// 意图是 worker 的【唯一职责、贯穿整个 run 的不变量】→ 连同启动指令、意图锚定的目标资产
 	// 原始数据一起放进 system prompt：system 每次 run 都重新拼一遍、绝不会被 compaction 压掉，
@@ -422,9 +439,10 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// 任务级 deadline(经 ctx 注入)夹逼本 run 的墙钟预算 + 决定收尾词(见 taskclock.go)。
 	tc := taskClockFrom(ctx)
 	maxDur, clamped := clampMaxDuration(tc.DeadlineUnix, w.runTimeout)
-	settle := wrapupSettlement("worker", []string{"Bash"})
+	disabled := workerSettlementDisabled(sc != nil)
+	settle := wrapupSettlement("worker", disabled)
 	if tc.DeadlineUnix > 0 {
-		settle = wrapupSettlementForTask("worker", []string{"Bash"}, clamped)
+		settle = wrapupSettlementForTask("worker", disabled, clamped)
 	}
 	opts := agentcore.Options{
 		Provider:        w.prov,

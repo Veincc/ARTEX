@@ -261,7 +261,14 @@ const (
 	// only routes the search backend) and the per-profile LLM proxy.
 	settingGlobalProxy = "global_proxy"
 	settingWorkers     = "workers"
-	settingLLMRecord   = "llm_record"
+	// Worker-rooted norma subagents (Option A). Default off: a worker run does
+	// not see an Agent tool, does not seed subagent depth, and settlement still
+	// hides only Bash. Depth 3 means worker=1 plus two nested levels. Parallel
+	// is the per-intent tree budget, independent of the worker pool.
+	settingWorkerSubagentsOn      = "worker_subagents_enabled"
+	settingWorkerSubagentMaxDepth = "worker_subagent_max_depth"
+	settingWorkerSubagentParallel = "worker_subagent_max_parallel"
+	settingLLMRecord              = "llm_record"
 	// LLM 轮询(故障转移)。默认关闭——开启后走「全局激活配置」的 agent 在当前配置
 	// 不可用(余额不足/key 失效/限流/服务异常)时自动切到下一个配置。
 	// settingLLMPoolBindFallback 仅在轮询开启时有意义:默认关闭,即 agent/任务显式
@@ -282,6 +289,10 @@ const (
 	deepSeekWebSearchBackend = "deepseek"
 	// defaultWorkers is the concurrent work-agent count when the setting is unset.
 	defaultWorkers = 3
+	// defaultWorkerSubagentMaxDepth / MaxParallel match agent.defaultSubagent*
+	// (worker depth 1, two further levels; four concurrent runs in one tree).
+	defaultWorkerSubagentMaxDepth    = 3
+	defaultWorkerSubagentMaxParallel = 4
 	// defaultConcurrencyLimit is the simultaneous-running-task cap when the feature
 	// is enabled but no explicit limit was saved.
 	defaultConcurrencyLimit = 5
@@ -334,6 +345,60 @@ func (m *Manager) SetWorkers(n int) error {
 		return fmt.Errorf("workers 必须 >0")
 	}
 	return m.pg.SetSetting(settingWorkers, strconv.Itoa(n))
+}
+
+// WorkerSubagentsEnabled reports whether a worker may spawn norma subagents.
+// Default false. Read per worker execute, so a toggle applies to the next intent.
+func (m *Manager) WorkerSubagentsEnabled() bool {
+	if m == nil || m.pg == nil {
+		return false
+	}
+	return m.pg.GetBool(settingWorkerSubagentsOn, false)
+}
+
+// WorkerSubagentMaxDepth is the norma MaxDepth seeded under the worker.
+// Default 3 (worker counts as depth 1; two further levels may spawn).
+func (m *Manager) WorkerSubagentMaxDepth() int {
+	return m.workerSubagentInt(settingWorkerSubagentMaxDepth, defaultWorkerSubagentMaxDepth)
+}
+
+// WorkerSubagentMaxParallel is the per-intent tree budget. Default 4.
+func (m *Manager) WorkerSubagentMaxParallel() int {
+	return m.workerSubagentInt(settingWorkerSubagentParallel, defaultWorkerSubagentMaxParallel)
+}
+
+func (m *Manager) workerSubagentInt(key string, def int) int {
+	if m == nil || m.pg == nil {
+		return def
+	}
+	v, ok, err := m.pg.GetSetting(key)
+	if err != nil || !ok {
+		return def
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || n < 1 {
+		return def
+	}
+	return n
+}
+
+// SetWorkerSubagents persists the subagent toggle and its two caps.
+// depth<1 or parallel<1 fall back to the defaults (3 and 4). The numbers are
+// stored even when enabled is false so a later toggle keeps the operator's caps.
+func (m *Manager) SetWorkerSubagents(enabled bool, maxDepth, maxParallel int) error {
+	if maxDepth < 1 {
+		maxDepth = defaultWorkerSubagentMaxDepth
+	}
+	if maxParallel < 1 {
+		maxParallel = defaultWorkerSubagentMaxParallel
+	}
+	if err := m.pg.SetSetting(settingWorkerSubagentMaxDepth, strconv.Itoa(maxDepth)); err != nil {
+		return err
+	}
+	if err := m.pg.SetSetting(settingWorkerSubagentParallel, strconv.Itoa(maxParallel)); err != nil {
+		return err
+	}
+	return m.pg.SetBool(settingWorkerSubagentsOn, enabled)
 }
 
 // Enrich returns the asset auto-completion engine (may be nil if init failed).
